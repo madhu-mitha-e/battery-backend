@@ -1,0 +1,4 @@
+battery_study_server.db
+__pycache__/
+*.pyc
+.env
