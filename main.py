@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import create_engine, Column, Integer, String, Float, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, UniqueConstraint, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pydantic import BaseModel
 from typing import List, Optional
@@ -9,21 +9,26 @@ import pandas as pd
 import io
 import os
 
-app = FastAPI(title="Battery Study Backend", version="1.0.0")
+app = FastAPI(title="Battery Study Backend", version="2.0.0")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "battery_study_server.db")
-engine = create_engine(
-    f"sqlite:///{DB_PATH}",
-    connect_args={"check_same_thread": False}
-)
+# --- DATABASE ---
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Set this on Render/Fly.io
+if not DATABASE_URL:
+    # Local fallback for testing
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'battery_study_server.db')}"
+    connect_args = {"check_same_thread": False}
+else:
+    connect_args = {}
+
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 class BatteryLogDB(Base):
     __tablename__ = "battery_logs"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    userId = Column(String, nullable=False)
+    userId = Column(String, nullable=False, index=True)
     deviceBrand = Column(String, default="")
     deviceModel = Column(String, default="")
     osVersion = Column(String, default="")
@@ -45,8 +50,14 @@ class BatteryLogDB(Base):
     logSource = Column(String, default="UNKNOWN")
     receivedAt = Column(String, default="")
 
+    # DEDUP CONSTRAINT
+    __table_args__ = (
+        UniqueConstraint('userId', 'timestamp', 'logSource', name='uq_user_timestamp_source'),
+    )
+
 Base.metadata.create_all(bind=engine)
 
+# --- MODELS ---
 class BatteryLogRequest(BaseModel):
     userId: str
     deviceBrand: Optional[str] = ""
@@ -72,6 +83,7 @@ class BatteryLogRequest(BaseModel):
 class BulkLogsRequest(BaseModel):
     logs: List[BatteryLogRequest]
 
+# --- ENDPOINTS ---
 @app.get("/health")
 def health_check():
     db = SessionLocal()
@@ -88,8 +100,18 @@ def receive_logs(request: BulkLogsRequest):
     db = SessionLocal()
     try:
         inserted = 0
+        skipped = 0
         received_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for log in request.logs:
+            # DEDUP CHECK
+            existing = db.query(BatteryLogDB).filter(
+                BatteryLogDB.userId == log.userId,
+                BatteryLogDB.timestamp == log.timestamp,
+                BatteryLogDB.logSource == log.logSource
+            ).first()
+            if existing:
+                skipped += 1
+                continue
             db_log = BatteryLogDB(
                 userId=log.userId,
                 deviceBrand=log.deviceBrand,
@@ -119,7 +141,8 @@ def receive_logs(request: BulkLogsRequest):
         return {
             "status": "success",
             "inserted": inserted,
-            "message": f"{inserted} logs received"
+            "skipped_duplicates": skipped,
+            "message": f"{inserted} inserted, {skipped} duplicates skipped"
         }
     except Exception as e:
         db.rollback()
@@ -139,28 +162,17 @@ def get_logs(limit: int = 100, user_id: Optional[str] = None):
             "total": len(logs),
             "logs": [
                 {
-                    "id": log.id,
-                    "userId": log.userId,
-                    "deviceBrand": log.deviceBrand,
-                    "deviceModel": log.deviceModel,
-                    "osVersion": log.osVersion,
-                    "batterySoc": log.batterySoc,
-                    "batteryTemperatureC": log.batteryTemperatureC,
-                    "batteryVoltageMv": log.batteryVoltageMv,
-                    "chargingStatus": log.chargingStatus,
-                    "chargingSource": log.chargingSource,
-                    "isCharging": log.isCharging,
-                    "screenOn": log.screenOn,
-                    "chargingCurrentMa": log.chargingCurrentMa,
+                    "id": log.id, "userId": log.userId, "deviceBrand": log.deviceBrand,
+                    "deviceModel": log.deviceModel, "osVersion": log.osVersion,
+                    "batterySoc": log.batterySoc, "batteryTemperatureC": log.batteryTemperatureC,
+                    "batteryVoltageMv": log.batteryVoltageMv, "chargingStatus": log.chargingStatus,
+                    "chargingSource": log.chargingSource, "isCharging": log.isCharging,
+                    "screenOn": log.screenOn, "chargingCurrentMa": log.chargingCurrentMa,
                     "remainingCapacityMah": log.remainingCapacityMah,
                     "batteryHealthPercent": log.batteryHealthPercent,
-                    "batteryHealthState": log.batteryHealthState,
-                    "timestamp": log.timestamp,
-                    "ambientTemperatureC": log.ambientTemperatureC,
-                    "humidity": log.humidity,
-                    "cityName": log.cityName,
-                    "logSource": log.logSource,
-                    "receivedAt": log.receivedAt
+                    "batteryHealthState": log.batteryHealthState, "timestamp": log.timestamp,
+                    "ambientTemperatureC": log.ambientTemperatureC, "humidity": log.humidity,
+                    "cityName": log.cityName, "logSource": log.logSource, "receivedAt": log.receivedAt
                 }
                 for log in logs
             ]
@@ -173,11 +185,8 @@ def get_stats():
     db = SessionLocal()
     try:
         total_logs = db.query(BatteryLogDB).count()
-        users = db.execute(
-            text("SELECT COUNT(DISTINCT userId) FROM battery_logs")
-        ).scalar()
-        latest = db.query(BatteryLogDB).order_by(
-            BatteryLogDB.id.desc()).first()
+        users = db.execute(text("SELECT COUNT(DISTINCT userId) FROM battery_logs")).scalar()
+        latest = db.query(BatteryLogDB).order_by(BatteryLogDB.id.desc()).first()
         return {
             "total_logs": total_logs,
             "total_users": users,
@@ -197,46 +206,31 @@ def export_csv(user_id: Optional[str] = None):
         logs = query.order_by(BatteryLogDB.id.asc()).all()
         if not logs:
             raise HTTPException(status_code=404, detail="No logs found")
-        data = []
-        for log in logs:
-            data.append({
-                "id": log.id,
-                "userId": log.userId,
-                "deviceBrand": log.deviceBrand,
-                "deviceModel": log.deviceModel,
-                "osVersion": log.osVersion,
-                "batterySoc": log.batterySoc,
-                "batteryTemperatureC": log.batteryTemperatureC,
-                "batteryVoltageMv": log.batteryVoltageMv,
-                "chargingStatus": log.chargingStatus,
-                "chargingSource": log.chargingSource,
-                "isCharging": log.isCharging,
-                "screenOn": log.screenOn,
-                "chargingCurrentMa": log.chargingCurrentMa,
+        data = [
+            {
+                "id": log.id, "userId": log.userId, "deviceBrand": log.deviceBrand,
+                "deviceModel": log.deviceModel, "osVersion": log.osVersion,
+                "batterySoc": log.batterySoc, "batteryTemperatureC": log.batteryTemperatureC,
+                "batteryVoltageMv": log.batteryVoltageMv, "chargingStatus": log.chargingStatus,
+                "chargingSource": log.chargingSource, "isCharging": log.isCharging,
+                "screenOn": log.screenOn, "chargingCurrentMa": log.chargingCurrentMa,
                 "remainingCapacityMah": log.remainingCapacityMah,
                 "batteryHealthPercent": log.batteryHealthPercent,
-                "batteryHealthState": log.batteryHealthState,
-                "timestamp": log.timestamp,
-                "ambientTemperatureC": log.ambientTemperatureC,
-                "humidity": log.humidity,
-                "cityName": log.cityName,
-                "logSource": log.logSource,
-                "receivedAt": log.receivedAt
-            })
+                "batteryHealthState": log.batteryHealthState, "timestamp": log.timestamp,
+                "ambientTemperatureC": log.ambientTemperatureC, "humidity": log.humidity,
+                "cityName": log.cityName, "logSource": log.logSource, "receivedAt": log.receivedAt
+            }
+            for log in logs
+        ]
         df = pd.DataFrame(data)
         output = io.StringIO()
         df.to_csv(output, index=False)
         output.seek(0)
-        if user_id:
-            filename = f"battery_study_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        else:
-            filename = f"battery_study_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"battery_study_{'all' if not user_id else user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         return StreamingResponse(
             io.BytesIO(output.getvalue().encode()),
             media_type="text/csv",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}"
-            }
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
     finally:
         db.close()
@@ -246,29 +240,17 @@ def get_users():
     db = SessionLocal()
     try:
         result = db.execute(text("""
-            SELECT
-                userId,
-                COUNT(*) as total_logs,
-                MIN(timestamp) as first_log,
-                MAX(timestamp) as last_log,
-                deviceBrand,
-                deviceModel,
-                cityName
-            FROM battery_logs
-            GROUP BY userId
-            ORDER BY total_logs DESC
+            SELECT userId, COUNT(*) as total_logs, MIN(timestamp) as first_log,
+                   MAX(timestamp) as last_log, deviceBrand, deviceModel, cityName
+            FROM battery_logs GROUP BY userId ORDER BY total_logs DESC
         """)).fetchall()
         return {
             "total_users": len(result),
             "users": [
                 {
-                    "userId": row[0],
-                    "total_logs": row[1],
-                    "first_log": row[2],
-                    "last_log": row[3],
-                    "deviceBrand": row[4],
-                    "deviceModel": row[5],
-                    "cityName": row[6]
+                    "userId": row[0], "total_logs": row[1], "first_log": row[2],
+                    "last_log": row[3], "deviceBrand": row[4],
+                    "deviceModel": row[5], "cityName": row[6]
                 }
                 for row in result
             ]
